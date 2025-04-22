@@ -6,15 +6,20 @@ use anyhow::Result;
 pub enum NVSKeyword {
     SerialNumber,
     DeviceName,
+    DeviceOwner,
 }
 
 pub fn print_info() {
-    println!("Information about device: \nDevice Name: {}\nSerial Number: {}", 
+    println!("Information about device: \nSerial Number: {}\nDevice Name: {}\nDevice Owner: {}\n", 
+        match read_nvs_data(NVSKeyword::SerialNumber).unwrap() {
+            Some(value)=>value,
+            None => "Unknown".to_string(),
+        },
         match read_nvs_data(NVSKeyword::DeviceName).unwrap() {
             Some(value)=>value,
             None => "Unknown".to_string(),
         },
-        match read_nvs_data(NVSKeyword::SerialNumber).unwrap() {
+        match read_nvs_data(NVSKeyword::DeviceOwner).unwrap() {
             Some(value)=>value,
             None => "Unknown".to_string(),
         },
@@ -66,6 +71,19 @@ pub fn read_nvs_data(keyword:NVSKeyword) -> Result<Option<String>> {
                 }
             }
         }
+        NVSKeyword::DeviceOwner => {
+            let mut buffer = [0u8; 64]; // Adjust the size as needed
+            match nvs.get_str("device_owner", &mut buffer) {
+                Ok(Some(device_owner)) => {
+                    log::info!("Read device name: {}", device_owner);
+                    return Ok(Some(device_owner.to_string()))
+                },
+                Ok(None) | Err(_) => {
+                    log::warn!("Keyword [{}] not found", "device_owner");
+                    return Ok(None)
+                }
+            }
+        }
         _ => log::error!("Unable to fetch NVSKeyword from enum")
     }
 
@@ -97,6 +115,22 @@ pub fn update_nvs_data(new_data: &str, keyword:NVSKeyword) -> Result<Option<()>>
             log::info!("Device name has been updated successfully!");
             return Ok(Some(()))
         }
+        NVSKeyword::DeviceOwner => {
+            let mut buffer = [0u8;64];
+            match nvs.get_str("device_owner", &mut buffer) {
+                Ok(Some(old_device_owner)) => {
+                    log::info!("Updating device name from '{}' to '{}'...", old_device_owner, new_data);
+                }
+                _ => {
+                    log::error!("Device has not been registered to a user, please manually create the user or register to someone"); return Ok(None)
+                }
+            }
+
+            nvs.set_str("device_owner", new_data)?;
+
+            log::info!("Device name has been updated successfully!");
+            return Ok(Some(()))
+        }
     }    
     Ok(None)
 }
@@ -106,9 +140,21 @@ pub(crate) fn store_device_name(name: &str) -> Result<()> {
     let nvs_partition = EspDefaultNvsPartition::take()?;
     let mut nvs = EspNvs::<NvsDefault>::new(nvs_partition, "storage", true)?;
     
-    // Store the serial number
+    // Store the device name
     nvs.set_str("device_name", name)?;
     
     log::info!("Device name saved: {}", name);
+    Ok(())
+}
+
+pub(crate) fn store_device_owner(name: &str) -> Result<()> {
+    // Open or create NVS namespace
+    let nvs_partition = EspDefaultNvsPartition::take()?;
+    let mut nvs = EspNvs::<NvsDefault>::new(nvs_partition, "storage", true)?;
+    
+    // Store the device owner
+    nvs.set_str("device_owner", name)?;
+    
+    log::info!("Device owner saved: {}", name);
     Ok(())
 }
