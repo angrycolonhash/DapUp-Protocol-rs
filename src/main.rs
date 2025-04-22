@@ -1,441 +1,483 @@
-mod utils;
-
-use esp32_nimble::{uuid128, BLEAdvertisementData, BLEDevice, BLEScan, NimbleProperties};
+use anyhow::Result;
 use esp_idf_hal::{
-    delay::FreeRtos,
-    prelude::Peripherals,
-    task::block_on,
-    timer::{TimerConfig, TimerDriver},
+    gpio::PinDriver,
+    peripherals::Peripherals,
 };
-use esp_idf_sys::{self as _};
+use esp_idf_svc::{
+    eventloop::EspSystemEventLoop,
+    wifi::{AuthMethod, ClientConfiguration, Configuration, EspWifi},
+    nvs::EspDefaultNvsPartition,
+};
+use esp_idf_sys::{
+    self as _, 
+    esp_now_add_peer, 
+    esp_now_deinit, 
+    esp_now_init, 
+    esp_now_register_recv_cb, 
+    esp_now_register_send_cb, 
+    esp_now_send, 
+    esp_now_unregister_recv_cb, 
+    esp_now_unregister_send_cb, 
+    esp_random, 
+    wifi_interface_t_WIFI_IF_STA, 
+    esp_now_peer_info_t, 
+    ESP_OK,
+    esp_now_recv_cb_t,
+    esp_now_send_cb_t,
+    esp_wifi_get_mac,
+    esp_now_recv_info_t,
+};
 use std::{
-    thread,
-    time::SystemTime,
     sync::{Arc, Mutex},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
     collections::HashMap,
+    ptr,
 };
-use utils::serial::*;
+use serde::{Serialize, Deserialize};
+use heapless::Vec as HVec;
 
-// Define our UUIDs
-const SERVICE_UUID: &str = "FF440000-0000-0000-0000-000000000000";
-const SERIAL_UUID: &str = "53657269-616C-4E75-6D62-657200000000"; // "SerialNumber" in hex
-const DEVICE_NAME_UUID: &str = "64657669-6365-6E61-6D65-000000000000"; // "devicename" in hex
-const DEVICE_OWNER_UUID: &str = "6465766F-776E-6572-0000-000000000000"; // "devowner" in hex
-const TIMESTAMP_UUID: &str = "74696D65-7374-616D-7000-000000000000"; // "timestamp" in hex
+// Define StreetPass-like feature constants
+const BROADCAST_INTERVAL_MS: u32 = 2000;  // How often to broadcast presence
+const INTERACTION_TTL: u64 = 86400;       // How long to remember interactions (1 day)
+const MAX_PEERS: usize = 20;              // Maximum number of peers to track
+const LED_PIN: i32 = 2;                   // ESP32 built-in LED pin
+const MAX_DATA_LEN: usize = 200;          // Max ESP-NOW data length
 
-// Increased stack sizes for ESP32-WROOM-32
-const ADVERTISE_STACK_SIZE: usize = 8192; // Doubled from typical 4096
-const SCAN_STACK_SIZE: usize = 8192;      // Doubled from typical 4096
+// MAC address length
+const MAC_ADDR_LEN: usize = 6;
 
-// Struct to hold blocklist information - simplified to reduce memory usage
-#[derive(Clone, Debug)]
-struct BlockedDevice {
-    serial_num: String,
-    device_name: String,
-    device_owner: String,
-    timestamp: u64,
+// Broadcast address (all FFs)
+const BROADCAST_MAC: [u8; MAC_ADDR_LEN] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+
+// User-configurable device info
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct DeviceInfo {
+    username: String,       // Username for display
+    avatar_id: u8,          // Avatar/icon identifier 
+    status_message: String, // Short status message
+    game_id: u16,           // Current "game" or activity identifier
 }
 
-// Global blocklist
+impl DeviceInfo {
+    fn new() -> Self {
+        unsafe {
+            DeviceInfo {
+                username: "StreetPassUser".to_string(),
+                avatar_id: (esp_random() % 10) as u8,
+                status_message: "Hello from ESP32!".to_string(),
+                game_id: 0,
+            }
+        }
+    }
+}
+
+// StreetPass packet definition
+#[derive(Serialize, Deserialize, Debug, Clone)]
+enum StreetPassPacket {
+    // Basic presence broadcast with device info
+    Beacon {
+        device_info: DeviceInfo,
+        timestamp: u64,
+    },
+    
+    // Acknowledgment of receiving a beacon
+    Ack {
+        timestamp: u64,
+    },
+    
+    // Game-specific data exchange
+    GameData {
+        game_id: u16,
+        data: HVec<u8, 128>,  // Limited size payload
+    },
+}
+
+// Struct to hold encounter information
+#[derive(Debug, Clone)]
+struct Encounter {
+    device_info: DeviceInfo,
+    first_seen: u64,
+    last_seen: u64,
+    interaction_count: u32,
+}
+
+// Application state
 struct AppState {
-    blocklist: HashMap<String, BlockedDevice>,
-    is_scanning: bool,
-    is_advertising: bool,
+    device_info: DeviceInfo,
+    encounters: HashMap<[u8; MAC_ADDR_LEN], Encounter>,
+    my_mac: [u8; MAC_ADDR_LEN],
+    led_on: bool,
 }
 
-fn main() -> anyhow::Result<()> {
-    // -----------------------------
-    // Required stuff, do not remove
-    // -----------------------------
+// Global application state
+static mut APP_STATE: Option<Arc<Mutex<AppState>>> = None;
+
+fn main() -> Result<()> {
+    // Required initializations
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
-    log::set_max_level(log::LevelFilter::Info); // Changing to Info level to reduce memory usage
-    // -----------------------------
+    log::set_max_level(log::LevelFilter::Info);
     
-    log::info!("Starting Dap-Up Protocol on ESP32-WROOM-32");
-
-    DeviceInfo::store_device_owner("tk");
+    log::info!("Starting StreetPass-like ESP-NOW Protocol");
     
-    // Create shared app state with smaller initial capacity for memory conservation
+    // Initialize hardware - we'll only initialize peripherals once
+    // and pass the modem to WiFi setup
+    let peripherals = Peripherals::take()?;
+    
+    // Setup WiFi in station mode (required for ESP-NOW)
+    setup_wifi(peripherals.modem)?;
+    
+    // Get our own MAC address
+    let mut mac = [0u8; MAC_ADDR_LEN];
+    unsafe {
+        esp_wifi_get_mac(wifi_interface_t_WIFI_IF_STA, mac.as_mut_ptr());
+    }
+    
+    log::info!("Device MAC address: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", 
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    
+    // Create application state
     let app_state = Arc::new(Mutex::new(AppState {
-        blocklist: HashMap::with_capacity(5), // Reduced capacity to save memory
-        is_scanning: false,
-        is_advertising: false,
+        device_info: DeviceInfo::new(),
+        encounters: HashMap::with_capacity(MAX_PEERS),
+        my_mac: mac,
+        led_on: false,
     }));
     
-    // Clone the app state for each thread
-    let state_adv = Arc::clone(&app_state);
-    let state_scan = Arc::clone(&app_state);
-
-    // Start advertising thread with increased stack size
-    let adv_handle = thread::Builder::new()
-        .name("ble_advertise".to_string())
-        .stack_size(ADVERTISE_STACK_SIZE)
-        .spawn(move || {
-            match ble_advertise(state_adv) {
-                Ok(_) => log::info!("BLE advertise thread terminated normally"),
-                Err(e) => log::error!("BLE advertise thread error: {:?}", e),
-            }
-        })
-        .unwrap();
+    // Store app state in global variable for callbacks
+    unsafe {
+        APP_STATE = Some(app_state.clone());
+    }
     
-    // Short delay to let advertising thread initialize
-    thread::sleep(std::time::Duration::from_millis(500));
+    // Initialize ESP-NOW
+    unsafe {
+        let result = esp_now_init();
+        if result != ESP_OK {
+            log::error!("Failed to initialize ESP-NOW: {}", result);
+            return Err(anyhow::anyhow!("ESP-NOW init failed"));
+        }
+        
+        // Register receive callback
+        let recv_cb: esp_now_recv_cb_t = Some(esp_now_receive_callback);
+        esp_now_register_recv_cb(recv_cb);
+        
+        // Register send callback
+        let send_cb: esp_now_send_cb_t = Some(esp_now_send_callback);
+        esp_now_register_send_cb(send_cb);
+        
+        // Add broadcast peer
+        let mut peer_info: esp_now_peer_info_t = std::mem::zeroed();
+        peer_info.peer_addr.copy_from_slice(&BROADCAST_MAC);
+        peer_info.channel = 0; // Auto channel
+        peer_info.ifidx = wifi_interface_t_WIFI_IF_STA;
+        
+        let result = esp_now_add_peer(&peer_info);
+        if result != ESP_OK {
+            log::error!("Failed to add broadcast peer: {}", result);
+        }
+    }
     
-    // Start scanning thread with increased stack size
-    let scan_handle = thread::Builder::new()
-        .name("ble_scan".to_string())
-        .stack_size(SCAN_STACK_SIZE)
+    // Create threads for broadcasting and LED control
+    let led_state = app_state.clone();
+    let broadcaster_state = app_state.clone();
+    
+    // LED control thread
+    let led_handle = thread::Builder::new()
+        .name("led_control".to_string())
+        .stack_size(4096)
         .spawn(move || {
-            match block_on(ble_scan(state_scan)) {
-                Ok(_) => log::info!("BLE scan thread terminated normally"),
-                Err(e) => log::error!("BLE scan thread error: {:?}", e),
+            let mut led = PinDriver::output(peripherals.pins.gpio2).unwrap();
+            loop {
+                // Flash LED when encounters occur
+                let should_light = {
+                    let state = led_state.lock().unwrap();
+                    state.led_on
+                };
+                
+                if should_light {
+                    led.set_high().unwrap_or_else(|e| log::error!("Failed to turn on LED: {:?}", e));
+                    thread::sleep(Duration::from_millis(100));
+                    led.set_low().unwrap_or_else(|e| log::error!("Failed to turn off LED: {:?}", e));
+                    
+                    // Reset LED state after flashing
+                    {
+                        let mut state = led_state.lock().unwrap();
+                        state.led_on = false;
+                    }
+                    
+                    // Keep LED off for a bit
+                    thread::sleep(Duration::from_millis(300));
+                } else {
+                    thread::sleep(Duration::from_millis(50));
+                }
             }
-        })
-        .unwrap();
+        })?;
+    
+    // Broadcaster thread
+    let broadcaster_handle = thread::Builder::new()
+        .name("broadcaster".to_string())
+        .stack_size(4096)
+        .spawn(move || {
+            loop {
+                // Create beacon packet
+                let packet = {
+                    let state = broadcaster_state.lock().unwrap();
+                    StreetPassPacket::Beacon {
+                        device_info: state.device_info.clone(),
+                        timestamp: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or(Duration::from_secs(0))
+                            .as_secs(),
+                    }
+                };
+                
+                // Serialize packet
+                let serialized = match serde_json::to_vec(&packet) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        log::error!("Failed to serialize packet: {:?}", e);
+                        thread::sleep(Duration::from_millis(BROADCAST_INTERVAL_MS as u64));
+                        continue;
+                    }
+                };
+                
+                // Send packet via ESP-NOW
+                if serialized.len() <= MAX_DATA_LEN {
+                    unsafe {
+                        let result = esp_now_send(
+                            BROADCAST_MAC.as_ptr(),
+                            serialized.as_ptr(),
+                            serialized.len()
+                        );
+                        
+                        if result != ESP_OK {
+                            log::warn!("Failed to send ESP-NOW packet: {}", result);
+                        }
+                    }
+                } else {
+                    log::warn!("Packet too large for ESP-NOW: {} bytes", serialized.len());
+                }
+                
+                // Wait before next broadcast
+                thread::sleep(Duration::from_millis(BROADCAST_INTERVAL_MS as u64));
+                
+                // Clean up old encounters
+                cleanup_old_encounters(&broadcaster_state);
+            }
+        })?;
     
     // Keep main thread alive
-    adv_handle.join().unwrap();
-    scan_handle.join().unwrap();
+    led_handle.join().unwrap();
+    broadcaster_handle.join().unwrap();
+    
+    // Cleanup ESP-NOW (never reached, but for completeness)
+    unsafe {
+        esp_now_unregister_recv_cb();
+        esp_now_unregister_send_cb();
+        esp_now_deinit();
+    }
     
     Ok(())
 }
 
-fn ble_advertise(app_state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
-    log::info!("Starting BLE advertising thread");
-    let device_info = DeviceInfo::new();
-    let ble_device = BLEDevice::take();
-    let ble_advertising = ble_device.get_advertising();
-
-    // Mark that we're now advertising
-    {
-        let mut state = app_state.lock().unwrap();
-        state.is_advertising = true;
-    }
-
-    let server = ble_device.get_server();
-    server.on_connect(|server, desc| {
-        log::info!("Client connected: {:?}", desc);
-        server
-            .update_conn_params(desc.conn_handle(), 24, 48, 0, 60)
-            .unwrap();
-    });
-
-    server.on_disconnect(|_desc, reason| {
-        log::info!("Client disconnected ({:?})", reason);
-    });
-
-    // Create service using uuid128! macro
-    let service = server.create_service(uuid128!(SERVICE_UUID));
+// Set up WiFi in station mode for ESP-NOW
+fn setup_wifi(modem: esp_idf_hal::modem::Modem) -> Result<()> {
+    log::info!("Configuring WiFi for ESP-NOW...");
     
-    // Create characteristics for all device info
-    let serial_char = service.lock().create_characteristic(
-        uuid128!(SERIAL_UUID),
-        NimbleProperties::READ,
-    );
-    serial_char.lock().set_value(device_info.serial_num.as_bytes());
+    // We'll use esp-idf-svc's WiFi instead of raw FFI calls for proper initialization
+    let sysloop = EspSystemEventLoop::take()?;
+    let nvs = EspDefaultNvsPartition::take()?;
     
-    let name_char = service.lock().create_characteristic(
-        uuid128!(DEVICE_NAME_UUID),
-        NimbleProperties::READ,
-    );
-    name_char.lock().set_value(device_info.device_name.as_bytes());
-    
-    let owner_char = service.lock().create_characteristic(
-        uuid128!(DEVICE_OWNER_UUID),
-        NimbleProperties::READ,
-    );
-    owner_char.lock().set_value(device_info.device_owner.as_bytes());
-    
-    // Timestamp characteristic (will be updated on connection)
-    let timestamp_char = service.lock().create_characteristic(
-        uuid128!(TIMESTAMP_UUID),
-        NimbleProperties::READ | NimbleProperties::WRITE | NimbleProperties::NOTIFY,
-    );
-    
-    // Handler for timestamp updates
-    timestamp_char.lock().on_write(|args| {
-        if let Ok(timestamp_str) = core::str::from_utf8(args.recv_data()) {
-            log::info!("Received timestamp data: {}", timestamp_str);
-        } else {
-            log::info!("Received timestamp data as bytes: {:?}", args.recv_data());
-        }
-    });
-    
-    // Set up advertising data
-    ble_advertising.lock().set_data(
-        BLEAdvertisementData::new()
-            .name(&device_info.device_name)
-            .add_service_uuid(uuid128!(SERVICE_UUID)),
+    let mut wifi = EspWifi::new(
+        modem,
+        sysloop,
+        Some(nvs),
     )?;
     
-    // Main advertising loop
-    ble_advertising.lock().start()?;
-    log::info!("Started advertising as '{}'", device_info.device_name);
+    log::info!("Setting WiFi configuration...");
     
-    // Server monitoring loop
-    loop {
-        // Check if we should stop advertising
-        {
-            let state = app_state.lock().unwrap();
-            if !state.is_advertising {
-                log::info!("Stopping advertising as requested");
-                break;
-            }
+    // Configure WiFi in station mode with empty SSID (we're just using ESP-NOW)
+    let ssid = heapless::String::<32>::new();
+    let password = heapless::String::<64>::new();
+    
+    // Configure WiFi in station mode
+    let wifi_config = Configuration::Client(
+        ClientConfiguration {
+            ssid,
+            password,
+            auth_method: AuthMethod::None,
+            ..Default::default()
+        }
+    );
+    
+    wifi.set_configuration(&wifi_config)?;
+    
+    // We need to start WiFi, but we don't need to connect to any AP
+    log::info!("Starting WiFi...");
+    wifi.start()?;
+    
+    // Wait for WiFi to initialize
+    std::thread::sleep(Duration::from_millis(100));
+    
+    log::info!("WiFi configured in station mode");
+    
+    // Keep WiFi alive to prevent deinitialization
+    std::mem::forget(wifi);
+    
+    Ok(())
+}
+
+// ESP-NOW receive callback
+unsafe extern "C" fn esp_now_receive_callback(
+    info: *const esp_now_recv_info_t, 
+    data: *const u8, 
+    data_len: i32
+) {
+    if info.is_null() || data.is_null() || data_len <= 0 {
+        return;
+    }
+
+    if let Some(app_state) = &APP_STATE {
+        // Get source MAC address from the info structure
+        let info_ref = &*info;
+        let src_mac_ptr = (*info_ref).src_addr;
+        
+        if src_mac_ptr.is_null() {
+            return;
         }
         
-        // Update the timestamp when a client is connected
-        if server.connected_count() > 0 {
+        // Copy the MAC address to an array
+        let mut src_mac = [0u8; MAC_ADDR_LEN];
+        ptr::copy_nonoverlapping(src_mac_ptr, src_mac.as_mut_ptr(), MAC_ADDR_LEN);
+        
+        // Skip messages from ourselves
+        let my_mac = {
+            let state = app_state.lock().unwrap();
+            state.my_mac
+        };
+        
+        if src_mac == my_mac {
+            return;
+        }
+        
+        // Copy data to a Vec
+        let mut data_vec = Vec::with_capacity(data_len as usize);
+        for i in 0..data_len {
+            data_vec.push(*data.add(i as usize));
+        }
+        
+        // Deserialize packet
+        if let Ok(packet) = serde_json::from_slice::<StreetPassPacket>(&data_vec) {
+            process_packet(app_state.clone(), &src_mac, packet);
+        } else {
+            log::warn!("Received malformed packet from {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", 
+                src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
+        }
+    }
+}
+
+// ESP-NOW send callback
+unsafe extern "C" fn esp_now_send_callback(
+    mac_addr: *const u8,
+    status: u32
+) {
+    if mac_addr.is_null() {
+        return;
+    }
+    
+    let mut dst_mac = [0u8; MAC_ADDR_LEN];
+    ptr::copy_nonoverlapping(mac_addr, dst_mac.as_mut_ptr(), MAC_ADDR_LEN);
+    
+    if status != 0 {
+        log::warn!("Failed to send ESP-NOW message to {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}: {}",
+            dst_mac[0], dst_mac[1], dst_mac[2], dst_mac[3], dst_mac[4], dst_mac[5], status);
+    }
+}
+
+// Process received packets
+fn process_packet(app_state: Arc<Mutex<AppState>>, src_mac: &[u8; MAC_ADDR_LEN], packet: StreetPassPacket) {
+    match packet {
+        StreetPassPacket::Beacon { device_info, timestamp } => {
+            log::info!("Received beacon from {}: {} ({})", 
+                format_mac(src_mac), 
+                device_info.username, 
+                device_info.status_message);
+            
+            // Record encounter
             let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::from_secs(0))
                 .as_secs();
             
-            timestamp_char.lock()
-                .set_value(now.to_string().as_bytes())
-                .notify();
-        }
-        
-        FreeRtos::delay_ms(1000);
-    }
-    
-    ble_advertising.lock().stop()?;
-    log::info!("Advertising stopped");
-    Ok(())
-}
-
-// For ESP32-WROOM-32, make sure we define static configs for BLE operations
-const BLE_SCAN_INTERVAL: u16 = 200;  // Longer scan interval (in 0.625ms units)
-const BLE_SCAN_WINDOW: u16 = 60;     // Smaller scan window (in 0.625ms units)
-const BLE_SCAN_DURATION: u32 = 4000; // Shorter scan duration (in ms)
-const BLE_CONN_TIMEOUT: u32 = 4000;  // Connection timeout (in ms)
-
-async fn ble_scan(app_state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
-    log::info!("Starting BLE scan thread");
-    
-    // Mark that we're now scanning
-    {
-        let mut state = app_state.lock().unwrap();
-        state.is_scanning = true;
-    }
-    
-    let peripherals = Peripherals::take()?;
-    let mut timer = TimerDriver::new(peripherals.timer00, &TimerConfig::new())?;
-    
-    let ble_device = BLEDevice::take();
-    
-    // Main scanning loop
-    loop {
-        // Check if we should stop scanning
-        {
-            let state = app_state.lock().unwrap();
-            if !state.is_scanning {
-                log::info!("Stopping scanning as requested");
-                break;
-            }
-        }
-        
-        // Create a new scan instance each time to avoid memory leaks
-        let mut ble_scan = BLEScan::new();
-        
-        // Configure scan with memory-optimized parameters
-        ble_scan
-            .active_scan(true)
-            .interval(BLE_SCAN_INTERVAL)
-            .window(BLE_SCAN_WINDOW);
-        
-        log::info!("Scanning for BLE devices...");
-        
-        // Start a short scan to conserve memory
-        let device = ble_scan.start(ble_device, BLE_SCAN_DURATION.try_into().unwrap(), |device, data| {
-            // First check if this device is in our blocklist
-            let addr_str = device.addr().to_string();
-            let is_blocked = {
-                let state = app_state.lock().unwrap();
-                state.blocklist.contains_key(&addr_str)
-            };
-            
-            if is_blocked {
-                log::info!("Skipping blocked device: {}", addr_str);
-                return None;
-            }
-            
-            // Then look for devices advertising our service UUID
-            for uuid in data.service_uuids() {
-                if uuid.to_string() == SERVICE_UUID {
-                    log::info!("Found device with our service: {}", addr_str);
-                    return Some(*device);
+            {
+                let mut state = app_state.lock().unwrap();
+                
+                // Check if we've seen this device before
+                let is_new = !state.encounters.contains_key(src_mac);
+                
+                // Update encounter record
+                let encounter = state.encounters
+                    .entry(*src_mac)
+                    .or_insert(Encounter {
+                        device_info: device_info.clone(),
+                        first_seen: now,
+                        last_seen: now,
+                        interaction_count: 0,
+                    });
+                
+                encounter.last_seen = now;
+                encounter.interaction_count += 1;
+                encounter.device_info = device_info.clone();
+                
+                // Flash LED for new encounters
+                if is_new {
+                    state.led_on = true;
+                    log::info!("New StreetPass encounter with {}!", device_info.username);
                 }
             }
-            None
-        })
-        .await?;
-        
-        if let Some(device) = device {
-            // Stop scanning and advertising when device found
-            {
-                let mut state = app_state.lock().unwrap();
-                state.is_advertising = false;
-                state.is_scanning = false;
+            
+            // Send acknowledgment
+            let ack_packet = StreetPassPacket::Ack { timestamp };
+            if let Ok(serialized) = serde_json::to_vec(&ack_packet) {
+                unsafe {
+                    esp_now_send(
+                        src_mac.as_ptr(),
+                        serialized.as_ptr(),
+                        serialized.len()
+                    );
+                }
             }
-            
-            // Explicitly drop the scanner to free up resources
-            std::mem::drop(ble_scan);
-            
-            // Process the connection with memory cleanup
-            process_connection(ble_device, device, app_state.clone()).await?;
-            
-            // Restart advertising and scanning
-            {
-                let mut state = app_state.lock().unwrap();
-                state.is_advertising = true;
-                state.is_scanning = true;
-            }
-            
-            // Give the system time to clean up resources
-            FreeRtos::delay_ms(500);
-        } else {
-            // Explicitly drop the scanner to free up resources
-            std::mem::drop(ble_scan);
-            
-            // Longer delay between scans to reduce memory pressure
-            FreeRtos::delay_ms(2000);
-        }
+        },
         
-        // Manual cleanup to help with memory management
-        unsafe {
-            // Request a garbage collection cycle if available
-            esp_idf_sys::heap_caps_check_integrity_all(true);
+        StreetPassPacket::Ack { timestamp } => {
+            log::debug!("Received acknowledgment for beacon sent at {}", timestamp);
+            // Could update stats here if needed
+        },
+        
+        StreetPassPacket::GameData { game_id, data: _ } => {
+            log::info!("Received game data for game ID: {}", game_id);
+            // Process game-specific data as needed
+            // This would be where game-specific logic would go
         }
     }
-    
-    log::info!("Scanning stopped");
-    Ok(())
 }
 
-// Process a connection to another device
-async fn process_connection(ble_device: &mut BLEDevice, device: esp32_nimble::BLEAdvertisedDevice, app_state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
-    log::info!("Processing connection to device: {}", device.addr());
+// Format MAC address as string
+fn format_mac(mac: &[u8; MAC_ADDR_LEN]) -> String {
+    format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", 
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5])
+}
+
+// Clean up old encounters based on TTL
+fn cleanup_old_encounters(app_state: &Arc<Mutex<AppState>>) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs();
     
-    // Create a client and connect to the found device
-    let mut client = ble_device.new_client();
-    let addr = device.addr();
-    
-    client.on_connect(|client| {
-        log::info!("Connected to server");
-        client.update_conn_params(120, 120, 0, 60).unwrap();
+    let mut state = app_state.lock().unwrap();
+    state.encounters.retain(|_, encounter| {
+        now - encounter.last_seen < INTERACTION_TTL
     });
-    
-    // Connect to the device with timeout
-    log::info!("Connecting to {}", addr);
-    match client.connect(&addr).await {
-        Ok(_) => log::info!("Successfully connected to {}", addr),
-        Err(e) => {
-            log::error!("Failed to connect to {}: {:?}", addr, e);
-            return Ok(());
-        }
-    }
-    
-    // Use scoped blocks to limit variable lifetimes and free memory earlier
-    let device_data = {
-        // Get our service
-        let service = match client.get_service(uuid128!(SERVICE_UUID)).await {
-            Ok(svc) => svc,
-            Err(e) => {
-                log::error!("Failed to get service: {:?}", e);
-                client.disconnect()?;
-                return Ok(());
-            }
-        };
-        
-        // Read all characteristics
-        let mut device_data = BlockedDevice {
-            serial_num: String::new(),
-            device_name: String::new(),
-            device_owner: String::new(),
-            timestamp: 0,
-        };
-        
-        // Read Serial Number
-        if let Ok(char) = service.get_characteristic(uuid128!(SERIAL_UUID)).await {
-            if let Ok(value) = char.read_value().await {
-                if let Ok(str_val) = core::str::from_utf8(&value) {
-                    device_data.serial_num = str_val.to_string();
-                    log::info!("Read serial number: {}", str_val);
-                }
-            }
-        }
-        
-        // Read Device Name
-        if let Ok(char) = service.get_characteristic(uuid128!(DEVICE_NAME_UUID)).await {
-            if let Ok(value) = char.read_value().await {
-                if let Ok(str_val) = core::str::from_utf8(&value) {
-                    device_data.device_name = str_val.to_string();
-                    log::info!("Read device name: {}", str_val);
-                }
-            }
-        }
-        
-        // Read Device Owner
-        if let Ok(char) = service.get_characteristic(uuid128!(DEVICE_OWNER_UUID)).await {
-            if let Ok(value) = char.read_value().await {
-                if let Ok(str_val) = core::str::from_utf8(&value) {
-                    device_data.device_owner = str_val.to_string();
-                    log::info!("Read device owner: {}", str_val);
-                }
-            }
-        }
-        
-        // Read Timestamp and send ACK
-        let mut success = false;
-        if let Ok(char) = service.get_characteristic(uuid128!(TIMESTAMP_UUID)).await {
-            if let Ok(value) = char.read_value().await {
-                if let Ok(str_val) = core::str::from_utf8(&value) {
-                    if let Ok(ts) = str_val.parse::<u64>() {
-                        device_data.timestamp = ts;
-                        log::info!("Read timestamp: {}", ts);
-                    }
-                }
-            }
-            
-            // Send ACK_OK by writing to the timestamp characteristic
-            let ack_message = "ACK_OK".as_bytes();
-            match char.write_value(ack_message, false).await {
-                Ok(_) => {
-                    log::info!("Sent ACK_OK confirmation");
-                    success = true;
-                },
-                Err(e) => log::error!("Failed to send ACK_OK: {:?}", e)
-            }
-        }
-        
-        // Only return device data if successful
-        if success {
-            Some(device_data)
-        } else {
-            None
-        }
-    };
-    
-    // Add to blocklist if we successfully got data
-    if let Some(data) = device_data {
-        // Add to blocklist
-        {
-            let mut state = app_state.lock().unwrap();
-            let addr_str = addr.to_string();
-            state.blocklist.insert(addr_str, data.clone());
-            log::info!("Added device to blocklist: {:?}", data);
-        }
-    }
-    
-    // Disconnect from device and clean up
-    log::info!("Disconnecting from {}", addr);
-    if let Err(e) = client.disconnect() {
-        log::error!("Error disconnecting: {:?}", e);
-    }
-    
-    // Force a small delay to allow resources to be freed
-    FreeRtos::delay_ms(100);
-    
-    Ok(())
 }
