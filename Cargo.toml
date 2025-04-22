@@ -31,6 +31,7 @@ toml-cfg = "0.2.0"
 esp-idf-hal = { version = "0.45.2", features = ["nightly"] }
 esp32-nimble = "0.11.1"
 esp-idf-sys = "0.36.1"
+bstr = "1.12.0"
 
 [build-dependencies]
 embuild = "0.33"
