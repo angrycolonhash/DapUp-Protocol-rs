@@ -1,90 +1,60 @@
 mod utils;
 
 use esp32_nimble::{enums::*, utilities::BleUuid, *};
+use esp_idf_hal::task::block_on;
 use esp_idf_hal::{delay::FreeRtos, sys::TaskFunction_t};
 use esp_idf_svc::sys::xTaskCreatePinnedToCore;
-use std::{ffi::{c_void, CString}, ptr};
 use esp_idf_sys::{self as _, ble_svc_gap_device_name};
+use std::{
+    ffi::{c_void, CString},
+    ptr,
+};
 use utils::{serial::*, thread};
-use esp_idf_hal::task::block_on;
 
-const SERVICE_UUID : BleUuid = BleUuid::from_uuid16(0xFF44);
+const SERVICE_UUID: BleUuid = BleUuid::from_uuid16(0xFF44);
 const SERIAL_UUID: BleUuid = BleUuid::from_uuid128([
-    0x53, 0x65, 0x72, 0x69, 0x61, 0x6C, 0x4E, 0x75,  // "SerialNu"
-    0x6D, 0x62, 0x65, 0x72, 0x00, 0x00, 0x00, 0x00   // "mber" + padding to 16 bytes
+    0x53, 0x65, 0x72, 0x69, 0x61, 0x6C, 0x4E, 0x75, // "SerialNu"
+    0x6D, 0x62, 0x65, 0x72, 0x00, 0x00, 0x00, 0x00, // "mber" + padding to 16 bytes
 ]);
 
-fn main() -> Result<(), anyhow::Error>{
+fn main() -> Result<(), anyhow::Error> {
     // -----------------------------
     // Required stuff, do not remove
     // -----------------------------
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
     log::set_max_level(log::LevelFilter::Debug);
-    // -----------------------------  
+    // -----------------------------
 
-    unsafe { thread::thread_start("ble_advertise", advertise_thread) };
-    unsafe { thread::thread_start("ble_scan", scan_thread) };
-
-    // let winklink_device_info: DeviceInfo = utils::serial::DeviceInfo::new();
-
-    // let _ = advertise_ble(&winklink_device_info);
-
-    loop {
-        // Keep the main thread alive otherwise it will panic
-        FreeRtos::delay_ms(500);
-    }
+    ble_server();
     Ok(())
 }
 
-unsafe extern "C" fn advertise_thread(arg: *mut c_void) {
-    let winklink_device_info: DeviceInfo = utils::serial::DeviceInfo::new();
-    loop {
-        let _ = advertise_ble(&winklink_device_info);
-        FreeRtos::delay_ms(100);
-    }
-}
-
-unsafe extern "C" fn scan_thread(arg: *mut c_void) {
-    let winklink_device_info: DeviceInfo = utils::serial::DeviceInfo::new();
-    loop {
-        let _ = scan_ble(&winklink_device_info);
-        FreeRtos::delay_ms(100);
-    }
-}
-
-async fn scan_ble(device_info: &DeviceInfo) -> anyhow::Result<()> {
-    let mut winklink_found = false;
-
+fn ble_server() -> anyhow::Result<()> {
+    let device_info = DeviceInfo::new();
     let ble_device = BLEDevice::take();
-    let mut ble_scan = BLEScan::new();
-    ble_scan.active_scan(true).interval(100).window(99);
+    let ble_advertising = ble_device.get_advertising();
 
-    ble_scan.start(
-        ble_device,
-        5000,
-        |device, data| {
-            log::info!("{:?},{:?}", &device, &data);
-            if let Some(service_data) = &data.service_data() {
-                if service_data.uuid == SERVICE_UUID {
-                    println!("Located another winklink");
-                    winklink_found = true;
-                } else {
-                    log::info!("No winklink device located yet :(");
-                }
-            }
+    let server = ble_device.get_server();
+    server.on_connect(|server, desc| {
+        log::info!("Client connected: {:?}", desc);
 
-            None::<()>
+        server.update_conn_params(desc.conn_handle(), 24, 48, 0, 100).unwrap();
+
+        if server.connected_count() < (esp_idf_svc::sys::CONFIG_BT_NIMBLE_MAX_CONNECTIONS as _) {
+            log::info!("Multi-connect support: start advertising");
+            ble_advertising.lock().start().unwrap();
         }
-    ).await?;
-    Ok(())
-}
+    });
 
-fn advertise_ble(device_info: &DeviceInfo) -> anyhow::Result<()> {
-    let mut counter = 0;
+    server.on_disconnect(|_desc, reason| {
+        log::info!("Client disconnected from server: [{:?}]", reason);
+    });
 
-    let ble_device = BLEDevice::take();
-    let ble_advertiser = ble_device.get_advertising();
+    let service = server.create_service(SERVICE_UUID);
+
+    // let serial_number = service.lock().create_characteristic(SERIAL_UUID, NimbleProperties::READ);
+    // serial_number.lock().set_value();
 
     let mut ad_data = BLEAdvertisementData::new();
     ad_data.name(&device_info.device_name);
@@ -93,14 +63,14 @@ fn advertise_ble(device_info: &DeviceInfo) -> anyhow::Result<()> {
     let bytes = serial_value.to_le_bytes();
     ad_data.service_data(SERIAL_UUID, &bytes);
 
-    ble_advertiser.lock().set_data(&mut ad_data).unwrap();
-    ble_advertiser.lock().advertisement_type(ConnMode::Non).disc_mode(DiscMode::Gen).scan_response(false);
+    ble_advertising.lock().set_data(&mut ad_data)?;
+    ble_advertising.lock().start()?;
 
-    ble_advertiser.lock().start().unwrap();
-    println!("Advertising started");
+    server.ble_gatts_show_local();
+
     loop {
-        FreeRtos::delay_ms(10);
-        counter+=1;
+        FreeRtos::delay_ms(1000);
     }
+
     Ok(())
 }
