@@ -1,7 +1,13 @@
 use esp_idf_sys::xTaskCreatePinnedToCore;
 use std::{ffi::{c_void, CString}, ptr};
 
-unsafe fn thread_start(name_of_task: &str, function: unsafe extern "C" fn(*mut c_void)) {
+
+/// Example of code: 
+/// ```rust
+/// unsafe extern "C" fn advertise_thread(arg: *mut c_void) {
+/// }
+/// ```
+pub unsafe fn thread_start(name_of_task: &str, function: unsafe extern "C" fn(*mut c_void)) {
     let task_name = CString::new(name_of_task).unwrap();
     let mut task_handle = ptr::null_mut();
     

@@ -1,0 +1,13 @@
+Advertised data: (
+    BLEAdvertisedDevice { 
+            addr: 57:D9:1E:8F:8C:34(random), 
+            adv_type: ScanInd, rssi: -56 
+        }, 
+    BLEAdvertisedData { 
+        service_uuids: [0xfe9f], 
+        service_data: BLEServiceData { 
+            uuid: 0xfe9f, 
+            service_data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] 
+        }
+    }
+)

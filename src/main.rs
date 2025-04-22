@@ -1,12 +1,27 @@
 mod utils;
 
-use esp32_nimble::*;
+use esp32_nimble::{utilities::BleUuid, *};
 use esp_idf_hal::{delay::FreeRtos, sys::TaskFunction_t};
 use esp_idf_svc::sys::xTaskCreatePinnedToCore;
 use std::{ffi::{c_void, CString}, ptr};
-use esp_idf_sys as _;
-use utils::serial::*;
+use esp_idf_sys::{self as _, ble_svc_gap_device_name};
+use utils::{serial::*, thread};
 use esp_idf_hal::task::block_on;
+
+struct WinkLink {
+    uuid_header: u16,
+    found: bool,
+}
+
+impl WinkLink {
+    fn new() -> Self {
+        return WinkLink {
+            found: false
+        }
+    }
+}
+
+const SERVICE_UUID : BleUuid = BleUuid::from_uuid16(0xFF44);
 
 fn main() -> Result<(), anyhow::Error>{
     // -----------------------------
@@ -14,27 +29,48 @@ fn main() -> Result<(), anyhow::Error>{
     // -----------------------------
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    log::set_max_level(log::LevelFilter::Debug);
     // -----------------------------
 
-    let name = match read_nvs_data(NVSKeyword::DeviceName).unwrap() {
-        Some(value)=>value,
-        None => "Unknown".to_string(),
-    };
+    let mut winklink_device = WinkLink::new();
 
-    // Create 2 threads, one to advertise and one to scan
+    let _ = scan_ble(&mut winklink_device);
 
-    // Once another device has been located, it will stop the advertise and scan threads.
-    // The MCU will setup a server and a client using another 2 threads
-    // Both devices will connect to each other and transfer information. 
+    Ok(())
+}
 
-    // After a final confirmation of non-corrupted correct data (ACK_OK), 
-    // it will add that device's MAC address to a blocklist (stopping connecting)
-    // before disconnecting from each other and looking for other users. (starting cycle over again)
+async fn scan_ble(winklink_device: &mut WinkLink) -> anyhow::Result<()> {
+    let ble_device = BLEDevice::take();
+    let mut ble_scan = BLEScan::new();
+    ble_scan.active_scan(true).interval(100).window(99);
 
-    // Blocklist can be edited through web server (for now, until displays can get working).
-    // Blocklists contain the device MAC address and the information about the device + user info.
-    // Blocklists only stop the MCU from connecting back to the device again, it is not a permanent thing
-    
+    ble_scan.start(
+        ble_device,
+        5000,
+        |device, data| {
+            log::info!("{:?},{:?}", &device, &data);
+            if let Some(service_data) = &data.service_data() {
+                if service_data.uuid == BleUuid::from_uuid16(SERVICE_UUID) {
+                    println!("Located another winklink");
+                    winklink_device.found = true;
+                } else {
+                    log::info!("No winklink device located yet :(");
+                }
+            }
+
+            None::<()>
+        }
+    ).await?;
+
+    log::info!("Scan finished!");
+    Ok(())
+}
+
+fn advertise_ble(winklink_device: &mut WinkLink) -> anyhow::Result<()> {
+    let ble_device = BLEDevice::take();
+    let server = ble_device.get_advertising();
+
+    let mut ad_data = BLEAdvertisementData::new();
 
     Ok(())
 }
